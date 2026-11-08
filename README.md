@@ -64,8 +64,12 @@ quanto você *pagaria* se mandasse todos os emails para a IA ler.
   O `2.50` acima é só um exemplo.
 
 O download fica em `emails.jsonl`. Se cair ou você apertar Ctrl+C, rode de novo:
-ele continua de onde parou. A cota do Gmail permite ~50 emails/s, então
-100 mil emails levam cerca de 40 a 60 minutos.
+ele continua de onde parou.
+
+A cota padrão do Gmail é de 6.000 unidades por minuto, e cada email custa 5 unidades,
+o que dá no máximo 20 emails/s. O script baixa 15/s por padrão (mude com `-rate`).
+Nesse ritmo, 20 mil emails levam ~25 min e 100 mil ~2 h. Se a cota estourar mesmo
+assim, o script pausa todos os downloads até a cota renovar e continua sozinho.
 
 ## O que é contado
 

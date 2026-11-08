@@ -24,6 +24,7 @@ type config struct {
 	includeSpam  bool
 	skipFetch    bool
 	workers      int
+	rate         float64
 	models       string
 	noAnthropic  bool
 	openaiPrice  float64
@@ -41,6 +42,7 @@ func main() {
 	flag.BoolVar(&c.includeSpam, "spam", false, "incluir Spam e Lixeira")
 	flag.BoolVar(&c.skipFetch, "skip-fetch", false, "não baixar nada, só contar o que já está no cache")
 	flag.IntVar(&c.workers, "workers", 10, "downloads simultâneos do Gmail")
+	flag.Float64Var(&c.rate, "rate", 15, "máximo de emails/s baixados (a cota padrão do Gmail permite até 20)")
 	flag.StringVar(&c.models, "models", "claude-opus-5-5,claude-sonnet-5-5,claude-haiku-5-5", "modelos Claude para contar tokens (separados por vírgula)")
 	flag.BoolVar(&c.noAnthropic, "no-anthropic", false, "pular a contagem via API da Anthropic")
 	flag.Float64Var(&c.openaiPrice, "openai-price", 0, "preço de input da OpenAI em USD por 1M tokens, só para o relatório calcular a estimativa (não gera cobrança)")

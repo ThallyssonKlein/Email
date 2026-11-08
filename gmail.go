@@ -204,22 +204,23 @@ func fetchAll(ctx context.Context, c config) error {
 	var mu sync.Mutex
 	enc := json.NewEncoder(out)
 
-	// Cota do Gmail: 250 unidades/usuário/segundo; messages.get custa 5 → ~50/s.
-	limiter := rate.NewLimiter(rate.Limit(40), 10)
+	// Cota padrão do Gmail: 6.000 unidades/minuto por usuário, e messages.get
+	// custa 5 → no máximo 20 emails/s. Usamos -rate (padrão 15/s) para ter folga.
+	prog := newProgress("baixados", "emails", len(todo))
+	gate := &quotaGate{limiter: rate.NewLimiter(rate.Limit(c.rate), 1), prog: prog, pauseFor: 65 * time.Second}
 	jobs := make(chan string)
 	var ok, failed atomic.Int64
 	var wg sync.WaitGroup
-	prog := newProgress("baixados", "emails", len(todo))
 
 	for w := 0; w < c.workers; w++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for id := range jobs {
-				msg, err := getWithRetry(ctx, srv, limiter, id)
+				msg, err := getWithRetry(ctx, srv, gate, id)
 				if err != nil {
 					if ctx.Err() == nil {
-						log.Printf("\nfalha em %s: %v", id, err)
+						prog.Log(fmt.Sprintf("falha em %s: %s (será tentado de novo na próxima execução)", id, shortErr(err)))
 					}
 					failed.Add(1)
 					prog.Add(1, false)
@@ -255,10 +256,50 @@ loop:
 
 var errStop = errors.New("stop")
 
-func getWithRetry(ctx context.Context, srv *gmail.Service, lim *rate.Limiter, id string) (*gmail.Message, error) {
-	backoff := time.Second
-	for attempt := 0; ; attempt++ {
-		if err := lim.Wait(ctx); err != nil {
+// quotaGate controla o ritmo de TODOS os downloads juntos. Quando o Gmail diz
+// que a cota estourou, pausa todo mundo até a janela de 1 minuto renovar, em
+// vez de cada download ficar insistindo (o que mantém a cota estourada).
+type quotaGate struct {
+	limiter  *rate.Limiter
+	prog     *progress
+	pauseFor time.Duration // quanto esperar quando a cota estoura
+
+	mu    sync.Mutex
+	until time.Time
+}
+
+func (g *quotaGate) Wait(ctx context.Context) error {
+	for {
+		g.mu.Lock()
+		d := time.Until(g.until)
+		g.mu.Unlock()
+		if d <= 0 {
+			break
+		}
+		select {
+		case <-time.After(d):
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	g.prog.SetNote("")
+	return g.limiter.Wait(ctx)
+}
+
+func (g *quotaGate) Pause(d time.Duration) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if t := time.Now().Add(d); t.After(g.until) {
+		g.until = t
+		g.prog.SetNote(fmt.Sprintf("cota do Gmail atingida, pausado até %s", t.Format("15:04:05")))
+	}
+}
+
+func getWithRetry(ctx context.Context, srv *gmail.Service, gate *quotaGate, id string) (*gmail.Message, error) {
+	backoff := 2 * time.Second
+	otherErrors := 0
+	for {
+		if err := gate.Wait(ctx); err != nil {
 			return nil, err
 		}
 		msg, err := srv.Users.Messages.Get("me", id).Format("full").Context(ctx).Do()
@@ -266,17 +307,51 @@ func getWithRetry(ctx context.Context, srv *gmail.Service, lim *rate.Limiter, id
 			return msg, nil
 		}
 		var gerr *googleapi.Error
-		retryable := errors.As(err, &gerr) && (gerr.Code == 429 || gerr.Code == 403 || gerr.Code >= 500)
-		if !retryable || attempt >= 6 {
+		if !errors.As(err, &gerr) {
 			return nil, err
 		}
-		select {
-		case <-time.After(backoff):
-		case <-ctx.Done():
-			return nil, ctx.Err()
+		switch {
+		case isRateLimit(gerr):
+			// Limite de cota: sempre recuperável, só esperar a janela renovar.
+			gate.Pause(gate.pauseFor)
+			continue
+		case gerr.Code >= 500 && otherErrors < 5:
+			otherErrors++
+			select {
+			case <-time.After(backoff):
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+			backoff *= 2
+		default:
+			return nil, err
 		}
-		backoff *= 2
 	}
+}
+
+func isRateLimit(e *googleapi.Error) bool {
+	if e.Code == 429 {
+		return true
+	}
+	if e.Code == 403 {
+		for _, item := range e.Errors {
+			switch item.Reason {
+			case "rateLimitExceeded", "userRateLimitExceeded", "quotaExceeded":
+				return true
+			}
+		}
+		return strings.Contains(e.Message, "Quota exceeded")
+	}
+	return false
+}
+
+// shortErr resume o erro em uma linha (sem o JSON de detalhes do Google).
+func shortErr(err error) string {
+	var gerr *googleapi.Error
+	if errors.As(err, &gerr) {
+		return fmt.Sprintf("HTTP %d: %s", gerr.Code, gerr.Message)
+	}
+	return err.Error()
 }
 
 // ---------- Parsing ----------

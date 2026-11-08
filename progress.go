@@ -21,6 +21,26 @@ type progress struct {
 
 	mu        sync.Mutex
 	lastPrint time.Time
+	note      string
+}
+
+// SetNote mostra um aviso no fim da linha (ex: pausa por cota). "" remove.
+func (p *progress) SetNote(s string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.note == s {
+		return
+	}
+	p.note = s
+	p.printLocked()
+}
+
+// Log imprime uma mensagem acima da linha de progresso, sem bagunçá-la.
+func (p *progress) Log(msg string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	fmt.Printf("\r\033[K  ! %s\n", msg)
+	p.printLocked()
 }
 
 func newProgress(label, unit string, total int) *progress {
@@ -78,6 +98,9 @@ func (p *progress) printLocked() {
 	}
 	if f := p.failed.Load(); f > 0 {
 		fmt.Fprintf(&b, " · %d falhas", f)
+	}
+	if p.note != "" {
+		fmt.Fprintf(&b, " · %s", p.note)
 	}
 	fmt.Print(b.String())
 }
