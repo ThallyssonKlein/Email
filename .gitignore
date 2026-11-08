@@ -1,0 +1,9 @@
+# segredos e dados pessoais — NUNCA commitar
+.env
+credentials.json
+token.json
+emails.jsonl
+*.jsonl
+
+# binário
+/email-tokens
