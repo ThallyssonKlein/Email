@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/joho/godotenv"
+	"golang.org/x/sync/errgroup"
 )
 
 type config struct {
@@ -41,8 +42,8 @@ func main() {
 	flag.IntVar(&c.max, "max", 0, "limite de emails a baixar (0 = todos)")
 	flag.BoolVar(&c.includeSpam, "spam", false, "incluir Spam e Lixeira")
 	flag.BoolVar(&c.skipFetch, "skip-fetch", false, "não baixar nada, só contar o que já está no cache")
-	flag.IntVar(&c.workers, "workers", 10, "downloads simultâneos do Gmail")
-	flag.Float64Var(&c.rate, "rate", 15, "máximo de emails/s baixados (a cota padrão do Gmail permite até 20)")
+	flag.IntVar(&c.workers, "workers", gmailDefaultWorkers, "downloads simultâneos do Gmail")
+	flag.Float64Var(&c.rate, "rate", gmailDefaultRate, "máximo de emails/s baixados (a cota padrão do Gmail permite até 20)")
 	flag.StringVar(&c.models, "models", "claude-opus-5-5,claude-sonnet-5-5,claude-haiku-5-5", "modelos Claude para contar tokens (separados por vírgula)")
 	flag.BoolVar(&c.noAnthropic, "no-anthropic", false, "pular a contagem via API da Anthropic")
 	flag.Float64Var(&c.openaiPrice, "openai-price", 0, "preço de input da OpenAI em USD por 1M tokens, só para o relatório calcular a estimativa (não gera cobrança)")
@@ -83,25 +84,52 @@ func main() {
 		report.attachments += len(e.Attachments)
 	}
 
-	if err := countOpenAI(emails, c.openaiEncode, report); err != nil {
-		log.Printf("aviso: contagem OpenAI falhou: %v", err)
-	}
-
 	if !c.noAnthropic && os.Getenv("ANTHROPIC_API_KEY") == "" && os.Getenv("ANTHROPIC_AUTH_TOKEN") == "" {
 		fmt.Println("  (ANTHROPIC_API_KEY não definida; tentando o perfil do `ant auth login`)")
 	}
+
+	var models []string
 	if !c.noAnthropic {
 		for _, m := range strings.Split(c.models, ",") {
-			m = strings.TrimSpace(m)
-			if m == "" {
-				continue
+			if m = strings.TrimSpace(m); m != "" {
+				models = append(models, m)
 			}
-			n, err := countAnthropic(ctx, emails, m)
+		}
+	}
+	batches := makeBatches(emails)
+
+	// A contagem OpenAI (local) e a de cada modelo Claude são independentes:
+	// rodam juntas, com uma única barra de progresso. O client da Anthropic
+	// (e portanto o rate limiter) é compartilhado entre os modelos.
+	prog := newProgress("contando tokens:", "passos", len(emails)+len(models)*len(batches))
+	client := newAnthropicClient()
+	claude := make([]modelCount, len(models)) // um slot por goroutine
+	claudeOK := make([]bool, len(models))
+
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(maxConcurrentCounts)
+	g.Go(func() error {
+		if err := countOpenAI(emails, c.openaiEncode, report, prog); err != nil {
+			prog.Log(fmt.Sprintf("aviso: contagem OpenAI falhou: %v", err))
+		}
+		return nil
+	})
+	for i, m := range models {
+		g.Go(func() error {
+			n, err := client.countTokens(gctx, batches, m, prog)
 			if err != nil {
-				log.Printf("aviso: contagem Anthropic (%s) falhou: %v", m, err)
-				continue
+				prog.Log(fmt.Sprintf("aviso: contagem Anthropic (%s) falhou: %v", m, err))
+				return nil // falha de um modelo não cancela os demais
 			}
-			report.claude = append(report.claude, modelCount{model: m, tokens: n})
+			claude[i], claudeOK[i] = modelCount{model: m, tokens: n}, true
+			return nil
+		})
+	}
+	_ = g.Wait()
+	prog.Finish()
+	for i := range claude {
+		if claudeOK[i] {
+			report.claude = append(report.claude, claude[i])
 		}
 	}
 

@@ -2,35 +2,37 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"strings"
 	"sync"
 	"text/tabwriter"
+	"time"
 
 	"github.com/anthropics/anthropic-sdk-go/v2"
 	"github.com/anthropics/anthropic-sdk-go/v2/option"
 	"github.com/pkoukk/tiktoken-go"
 	tiktoken_loader "github.com/pkoukk/tiktoken-go-loader"
 	"golang.org/x/sync/errgroup"
+	"golang.org/x/time/rate"
 )
 
 // ---------- OpenAI (local, grátis, offline) ----------
 
-func countOpenAI(emails []Email, encoding string, r *report) error {
+func countOpenAI(emails []Email, encoding string, r *report, prog *progress) error {
 	tiktoken.SetBpeLoader(tiktoken_loader.NewOfflineLoader())
 	enc, err := tiktoken.GetEncoding(encoding)
 	if err != nil {
 		return err
 	}
 	var total int64
-	prog := newProgress("OpenAI ("+encoding+"):", "emails", len(emails))
 	for _, e := range emails {
 		// EncodeOrdinary trata "<|endoftext|>" etc. como texto comum.
 		total += int64(len(enc.EncodeOrdinary(e.Text())))
 		prog.Add(1, true)
 	}
-	prog.Finish()
 	r.openai = total
 	r.openaiEnc = encoding
 	return nil
@@ -38,49 +40,117 @@ func countOpenAI(emails []Email, encoding string, r *report) error {
 
 // ---------- Anthropic (API count_tokens, grátis, com rate limit) ----------
 
+// Limites da API count_tokens (limite por organização, varia por tier; o
+// menor é 100 requisições/min). Ficamos abaixo disso, e o client é único e
+// compartilhado por todos os modelos.
+const (
+	anthropicRequestsPerSecond = 1.5 // ~90/min
+	anthropicBurst             = 4
+	maxConcurrentCountRequests = 4 // requisições em voo, somando todos os modelos
+	maxConcurrentCounts        = 4 // tarefas de contagem simultâneas (OpenAI + modelos)
+
+	anthropicMaxRetries     = 5 // após 429/5xx, por requisição
+	anthropicBackoffBase    = 2 * time.Second
+	anthropicRequestTimeout = 10 * time.Minute // teto de tempo (com retries) por requisição
+)
+
 // Agrupa vários emails por requisição para fazer poucas chamadas.
 // ~300k caracteres fica bem abaixo do contexto de 1M tokens mesmo em textos
 // "caros" (código, CJK etc.).
 const maxCharsPerRequest = 300_000
 
-func countAnthropic(ctx context.Context, emails []Email, model string) (int64, error) {
-	client := anthropic.NewClient(option.WithMaxRetries(8))
+// anthropicClient junta o SDK, o rate limiter e o teto de requisições em voo.
+// Crie um só (newAnthropicClient) e compartilhe entre goroutines.
+type anthropicClient struct {
+	api      anthropic.Client
+	limiter  *rate.Limiter
+	inflight chan struct{}
+}
 
-	count := func(blocks []string, opts ...option.RequestOption) (int64, error) {
-		content := make([]anthropic.ContentBlockParamUnion, len(blocks))
-		for i, b := range blocks {
-			content[i] = anthropic.NewTextBlock(b)
-		}
-		res, err := client.Messages.CountTokens(ctx, anthropic.MessageCountTokensParams{
-			Model:    model,
-			Messages: []anthropic.MessageParam{anthropic.NewUserMessage(content...)},
-		}, opts...)
-		if err != nil {
-			return 0, err
-		}
-		return res.InputTokens, nil
+func newAnthropicClient() *anthropicClient {
+	return &anthropicClient{
+		// Retries ficam por nossa conta: assim cada tentativa passa pelo limiter.
+		api:      anthropic.NewClient(option.WithMaxRetries(0)),
+		limiter:  rate.NewLimiter(rate.Limit(anthropicRequestsPerSecond), anthropicBurst),
+		inflight: make(chan struct{}, maxConcurrentCountRequests),
+	}
+}
+
+// count faz uma requisição count_tokens, respeitando limiter, 429/5xx e Retry-After.
+func (c *anthropicClient) count(ctx context.Context, model string, blocks []string) (int64, error) {
+	ctx, cancel := context.WithTimeout(ctx, anthropicRequestTimeout)
+	defer cancel()
+
+	content := make([]anthropic.ContentBlockParamUnion, len(blocks))
+	for i, b := range blocks {
+		content[i] = anthropic.NewTextBlock(b)
+	}
+	params := anthropic.MessageCountTokensParams{
+		Model:    model,
+		Messages: []anthropic.MessageParam{anthropic.NewUserMessage(content...)},
 	}
 
+	backoff := anthropicBackoffBase
+	for attempt := 0; ; attempt++ {
+		if err := c.limiter.Wait(ctx); err != nil {
+			return 0, fmt.Errorf("waiting for rate limit: %w", err)
+		}
+		res, err := c.do(ctx, params)
+		if err == nil {
+			return res.InputTokens, nil
+		}
+		var aerr *anthropic.Error
+		retryable := errors.As(err, &aerr) &&
+			(aerr.StatusCode == http.StatusTooManyRequests || aerr.StatusCode >= 500)
+		if !retryable || attempt >= anthropicMaxRetries {
+			return 0, err
+		}
+		var wait time.Duration
+		if aerr.Response != nil {
+			wait, _ = retryAfter(aerr.Response.Header)
+		}
+		if wait == 0 {
+			wait = withJitter(backoff)
+			backoff *= 2
+		}
+		t := time.NewTimer(wait)
+		select {
+		case <-t.C:
+		case <-ctx.Done():
+			t.Stop()
+			return 0, ctx.Err()
+		}
+	}
+}
+
+func (c *anthropicClient) do(ctx context.Context, params anthropic.MessageCountTokensParams) (*anthropic.MessageTokensCount, error) {
+	select {
+	case c.inflight <- struct{}{}:
+		defer func() { <-c.inflight }()
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	return c.api.Messages.CountTokens(ctx, params)
+}
+
+// countTokens soma os tokens de todos os lotes para um modelo.
+func (c *anthropicClient) countTokens(ctx context.Context, batches [][]string, model string, prog *progress) (int64, error) {
 	// Overhead fixo de uma requisição (tokens de formatação da mensagem),
 	// descontado de cada lote para sobrar só o conteúdo dos emails.
-	// Sem retries aqui: se faltar credencial ou o modelo for inválido, falha rápido.
-	overhead, err := count([]string{"."}, option.WithMaxRetries(0))
+	// Credencial faltando ou modelo inválido (4xx) falham rápido, sem retry.
+	overhead, err := c.count(ctx, model, []string{"."})
 	if err != nil {
 		return 0, err
 	}
 	overhead-- // o "." em si
 
-	batches := makeBatches(emails)
-	prog := newProgress(model+":", "req", len(batches))
-
 	var total int64
 	var mu sync.Mutex
 	g, gctx := errgroup.WithContext(ctx)
-	g.SetLimit(4)
-	ctx = gctx
+	g.SetLimit(maxConcurrentCountRequests)
 	for _, b := range batches {
 		g.Go(func() error {
-			n, err := count(b)
+			n, err := c.count(gctx, model, b)
 			if err != nil {
 				return err
 			}
@@ -91,9 +161,7 @@ func countAnthropic(ctx context.Context, emails []Email, model string) (int64, e
 			return nil
 		})
 	}
-	err = g.Wait()
-	prog.Finish()
-	if err != nil {
+	if err := g.Wait(); err != nil {
 		return 0, err
 	}
 	return total, nil

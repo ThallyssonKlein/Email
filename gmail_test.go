@@ -34,7 +34,7 @@ func TestQuotaPauseAndResume(t *testing.T) {
 		t.Fatal(err)
 	}
 	prog := newProgress("teste", "emails", 1)
-	gate := &quotaGate{limiter: rate.NewLimiter(rate.Inf, 1), prog: prog, pauseFor: 200 * time.Millisecond}
+	gate := &quotaGate{limiter: rate.NewLimiter(rate.Inf, gmailBurst), prog: prog, pauseFor: 200 * time.Millisecond}
 
 	start := time.Now()
 	msg, err := getWithRetry(context.Background(), gsrv, gate, "abc")
@@ -67,5 +67,40 @@ func TestNonQuota403Fails(t *testing.T) {
 	}
 	if got := shortErr(err); got != "HTTP 403: Insufficient Permission" {
 		t.Fatalf("mensagem curta inesperada: %q", got)
+	}
+}
+
+func TestQuotaRetriesAreBounded(t *testing.T) {
+	var calls atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(403)
+		w.Write([]byte(quotaBody))
+	}))
+	defer srv.Close()
+	gsrv, _ := gmail.NewService(context.Background(), option.WithEndpoint(srv.URL), option.WithoutAuthentication())
+	gate := &quotaGate{limiter: rate.NewLimiter(rate.Inf, gmailBurst), prog: newProgress("teste", "emails", 1), pauseFor: time.Millisecond}
+
+	if _, err := getWithRetry(context.Background(), gsrv, gate, "abc"); err == nil {
+		t.Fatal("deveria desistir depois de maxQuotaRetries")
+	}
+	if got := calls.Load(); got != maxQuotaRetries+1 {
+		t.Fatalf("chamadas = %d, esperado %d", got, maxQuotaRetries+1)
+	}
+}
+
+func TestRetryAfterHeader(t *testing.T) {
+	h := http.Header{}
+	if _, ok := retryAfter(h); ok {
+		t.Fatal("sem header não deveria haver Retry-After")
+	}
+	h.Set("Retry-After", "7")
+	if d, ok := retryAfter(h); !ok || d != 7*time.Second {
+		t.Fatalf("got %v %v", d, ok)
+	}
+	h.Set("Retry-After", time.Now().Add(30*time.Second).UTC().Format(http.TimeFormat))
+	if d, ok := retryAfter(h); !ok || d < 25*time.Second || d > 31*time.Second {
+		t.Fatalf("data HTTP: got %v %v", d, ok)
 	}
 }

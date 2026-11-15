@@ -21,10 +21,26 @@ import (
 	"golang.org/x/net/html"
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
+	"golang.org/x/sync/errgroup"
 	"golang.org/x/time/rate"
 	"google.golang.org/api/gmail/v1"
 	"google.golang.org/api/googleapi"
 	"google.golang.org/api/option"
+)
+
+// Limites do Gmail API (cota padrão: 6.000 unidades/minuto por usuário; cada
+// messages.get custa 5 → no máximo 20 emails/s). Os padrões ficam abaixo disso.
+const (
+	gmailDefaultRate    = 15 // emails/s (flag -rate)
+	gmailBurst          = 1
+	gmailDefaultWorkers = 10               // downloads simultâneos (flag -workers)
+	gmailQuotaPause     = 65 * time.Second // janela de cota é de 1 minuto
+
+	maxQuotaRetries       = 5                // tentativas após estouro de cota, por email
+	maxServerErrorRetries = 5                // tentativas após 5xx, por email
+	retryBackoffBase      = 2 * time.Second  // backoff inicial para 5xx
+	perMessageTimeout     = 10 * time.Minute // teto de tempo (com retries) por email
+	oauthShutdownTimeout  = 5 * time.Second
 )
 
 // Email é o que fica salvo no cache (uma linha JSON por email).
@@ -110,8 +126,25 @@ func loginInBrowser(ctx context.Context, cfg *oauth2.Config) (*oauth2.Token, err
 		codeCh <- r.URL.Query().Get("code")
 		fmt.Fprintln(w, "Pronto! Pode fechar esta aba e voltar ao terminal.")
 	})}
-	go srv.Serve(ln)
-	defer srv.Shutdown(context.Background())
+	var serveGroup errgroup.Group
+	serveGroup.Go(func() error {
+		if err := srv.Serve(ln); !errors.Is(err, http.ErrServerClosed) {
+			select {
+			case errCh <- err:
+			default:
+			}
+			return err
+		}
+		return nil
+	})
+	defer func() {
+		sctx, cancel := context.WithTimeout(context.Background(), oauthShutdownTimeout)
+		defer cancel()
+		_ = srv.Shutdown(sctx)
+		if err := serveGroup.Wait(); err != nil {
+			log.Printf("aviso: servidor de login encerrou com erro: %v", err)
+		}
+	}()
 
 	url := cfg.AuthCodeURL(state, oauth2.AccessTypeOffline)
 	fmt.Printf("Abra este link no navegador para autorizar acesso (somente leitura) ao Gmail:\n\n%s\n\n", url)
@@ -204,54 +237,45 @@ func fetchAll(ctx context.Context, c config) error {
 	var mu sync.Mutex
 	enc := json.NewEncoder(out)
 
-	// Cota padrão do Gmail: 6.000 unidades/minuto por usuário, e messages.get
-	// custa 5 → no máximo 20 emails/s. Usamos -rate (padrão 15/s) para ter folga.
 	prog := newProgress("baixados", "emails", len(todo))
-	gate := &quotaGate{limiter: rate.NewLimiter(rate.Limit(c.rate), 1), prog: prog, pauseFor: 65 * time.Second}
-	jobs := make(chan string)
+	gate := newQuotaGate(c.rate, prog)
 	var ok, failed atomic.Int64
-	var wg sync.WaitGroup
 
-	for w := 0; w < c.workers; w++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for id := range jobs {
-				msg, err := getWithRetry(ctx, srv, gate, id)
-				if err != nil {
-					if ctx.Err() == nil {
-						prog.Log(fmt.Sprintf("falha em %s: %s (será tentado de novo na próxima execução)", id, shortErr(err)))
-					}
-					failed.Add(1)
-					prog.Add(1, false)
-					continue
-				}
-				e := parseMessage(msg)
-				mu.Lock()
-				_ = enc.Encode(e)
-				mu.Unlock()
-				ok.Add(1)
-				prog.Add(1, true)
-			}
-		}()
-	}
-
-loop:
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(c.workers)
 	for _, id := range todo {
-		select {
-		case jobs <- id:
-		case <-ctx.Done():
-			break loop
+		if gctx.Err() != nil {
+			break
 		}
+		g.Go(func() error {
+			msg, err := getWithRetry(gctx, srv, gate, id)
+			if err != nil {
+				if gctx.Err() == nil {
+					prog.Log(fmt.Sprintf("falha em %s: %s (será tentado de novo na próxima execução)", id, shortErr(err)))
+				}
+				failed.Add(1)
+				prog.Add(1, false)
+				return nil // falha de um email não cancela os demais
+			}
+			e := parseMessage(msg)
+			mu.Lock()
+			encErr := enc.Encode(e)
+			mu.Unlock()
+			if encErr != nil {
+				return fmt.Errorf("gravando cache: %w", encErr)
+			}
+			ok.Add(1)
+			prog.Add(1, true)
+			return nil
+		})
 	}
-	close(jobs)
-	wg.Wait()
+	waitErr := g.Wait()
 	prog.Finish()
 	fmt.Printf("Download concluído: %d ok, %d falhas.\n", ok.Load(), failed.Load())
 	if ctx.Err() != nil {
 		fmt.Println("Interrompido — rode de novo para continuar de onde parou.")
 	}
-	return nil
+	return waitErr
 }
 
 var errStop = errors.New("stop")
@@ -259,13 +283,22 @@ var errStop = errors.New("stop")
 // quotaGate controla o ritmo de TODOS os downloads juntos. Quando o Gmail diz
 // que a cota estourou, pausa todo mundo até a janela de 1 minuto renovar, em
 // vez de cada download ficar insistindo (o que mantém a cota estourada).
+// Deve ser criado uma única vez (newQuotaGate) e compartilhado entre workers.
 type quotaGate struct {
 	limiter  *rate.Limiter
 	prog     *progress
-	pauseFor time.Duration // quanto esperar quando a cota estoura
+	pauseFor time.Duration // quanto esperar quando a cota estoura e não há Retry-After
 
 	mu    sync.Mutex
 	until time.Time
+}
+
+func newQuotaGate(perSecond float64, prog *progress) *quotaGate {
+	return &quotaGate{
+		limiter:  rate.NewLimiter(rate.Limit(perSecond), gmailBurst),
+		prog:     prog,
+		pauseFor: gmailQuotaPause,
+	}
 }
 
 func (g *quotaGate) Wait(ctx context.Context) error {
@@ -276,9 +309,11 @@ func (g *quotaGate) Wait(ctx context.Context) error {
 		if d <= 0 {
 			break
 		}
+		t := time.NewTimer(d)
 		select {
-		case <-time.After(d):
+		case <-t.C:
 		case <-ctx.Done():
+			t.Stop()
 			return ctx.Err()
 		}
 	}
@@ -295,9 +330,14 @@ func (g *quotaGate) Pause(d time.Duration) {
 	}
 }
 
+// getWithRetry baixa um email respeitando o gate. Toda tentativa (inclusive
+// retry) passa pelo limiter; o total de tentativas e de tempo é limitado.
 func getWithRetry(ctx context.Context, srv *gmail.Service, gate *quotaGate, id string) (*gmail.Message, error) {
-	backoff := 2 * time.Second
-	otherErrors := 0
+	ctx, cancel := context.WithTimeout(ctx, perMessageTimeout)
+	defer cancel()
+
+	backoff := retryBackoffBase
+	quotaRetries, serverRetries := 0, 0
 	for {
 		if err := gate.Wait(ctx); err != nil {
 			return nil, err
@@ -311,18 +351,28 @@ func getWithRetry(ctx context.Context, srv *gmail.Service, gate *quotaGate, id s
 			return nil, err
 		}
 		switch {
-		case isRateLimit(gerr):
-			// Limite de cota: sempre recuperável, só esperar a janela renovar.
-			gate.Pause(gate.pauseFor)
-			continue
-		case gerr.Code >= 500 && otherErrors < 5:
-			otherErrors++
+		case isRateLimit(gerr) && quotaRetries < maxQuotaRetries:
+			// Limite de cota: esperar Retry-After (ou a janela renovar), todos juntos.
+			quotaRetries++
+			wait, ok := retryAfter(gerr.Header)
+			if !ok {
+				wait = gate.pauseFor
+			}
+			gate.Pause(wait)
+		case gerr.Code >= 500 && serverRetries < maxServerErrorRetries:
+			serverRetries++
+			wait, ok := retryAfter(gerr.Header)
+			if !ok {
+				wait = withJitter(backoff)
+				backoff *= 2
+			}
+			t := time.NewTimer(wait)
 			select {
-			case <-time.After(backoff):
+			case <-t.C:
 			case <-ctx.Done():
+				t.Stop()
 				return nil, ctx.Err()
 			}
-			backoff *= 2
 		default:
 			return nil, err
 		}
