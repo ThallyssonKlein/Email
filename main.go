@@ -1,5 +1,5 @@
-// email-tokens: baixa todos os emails de uma conta Gmail e estima quantos
-// tokens uma IA (Anthropic Claude / OpenAI GPT) consumiria para ler todos.
+// email-tokens: downloads all emails from a Gmail account and estimates how
+// many tokens an AI (Anthropic Claude / OpenAI GPT) would consume to read them.
 package main
 
 import (
@@ -34,27 +34,27 @@ type config struct {
 
 func main() {
 	var c config
-	flag.StringVar(&c.envFile, "env", ".env", "arquivo .env com ANTHROPIC_API_KEY (opcional)")
-	flag.StringVar(&c.credentials, "credentials", "credentials.json", "arquivo OAuth client (Desktop app) baixado do Google Cloud Console")
-	flag.StringVar(&c.tokenFile, "token", "token.json", "onde salvar/ler o token OAuth do usuário")
-	flag.StringVar(&c.cache, "cache", "emails.jsonl", "cache local dos emails baixados (permite retomar)")
-	flag.StringVar(&c.query, "q", "", `filtro de busca do Gmail, ex: "after:2024/01/01 -category:promotions"`)
-	flag.IntVar(&c.max, "max", 0, "limite de emails a baixar (0 = todos)")
-	flag.BoolVar(&c.includeSpam, "spam", false, "incluir Spam e Lixeira")
-	flag.BoolVar(&c.skipFetch, "skip-fetch", false, "não baixar nada, só contar o que já está no cache")
-	flag.IntVar(&c.workers, "workers", gmailDefaultWorkers, "downloads simultâneos do Gmail")
-	flag.Float64Var(&c.rate, "rate", gmailDefaultRate, "máximo de emails/s baixados (a cota padrão do Gmail permite até 20)")
-	flag.StringVar(&c.models, "models", "claude-opus-5-5,claude-sonnet-5-5,claude-haiku-5-5", "modelos Claude para contar tokens (separados por vírgula)")
-	flag.BoolVar(&c.noAnthropic, "no-anthropic", false, "pular a contagem via API da Anthropic")
-	flag.Float64Var(&c.openaiPrice, "openai-price", 0, "preço de input da OpenAI em USD por 1M tokens, só para o relatório calcular a estimativa (não gera cobrança)")
-	flag.StringVar(&c.openaiEncode, "openai-encoding", "o200k_base", "encoding do tiktoken (o200k_base = GPT-4o/4.1/5; cl100k_base = GPT-4/3.5)")
+	flag.StringVar(&c.envFile, "env", ".env", ".env file with ANTHROPIC_API_KEY (optional)")
+	flag.StringVar(&c.credentials, "credentials", "credentials.json", "OAuth client file (Desktop app) downloaded from the Google Cloud Console")
+	flag.StringVar(&c.tokenFile, "token", "token.json", "where to save/read the user's OAuth token")
+	flag.StringVar(&c.cache, "cache", "emails.jsonl", "local cache of downloaded emails (allows resuming)")
+	flag.StringVar(&c.query, "q", "", `Gmail search filter, e.g. "after:2024/01/01 -category:promotions"`)
+	flag.IntVar(&c.max, "max", 0, "limit of emails to download (0 = all)")
+	flag.BoolVar(&c.includeSpam, "spam", false, "include Spam and Trash")
+	flag.BoolVar(&c.skipFetch, "skip-fetch", false, "download nothing, only count what is already in the cache")
+	flag.IntVar(&c.workers, "workers", gmailDefaultWorkers, "simultaneous Gmail downloads")
+	flag.Float64Var(&c.rate, "rate", gmailDefaultRate, "maximum emails/s downloaded (the default Gmail quota allows up to 20)")
+	flag.StringVar(&c.models, "models", "claude-opus-5-5,claude-sonnet-5-5,claude-haiku-5-5", "Claude models used to count tokens (comma-separated)")
+	flag.BoolVar(&c.noAnthropic, "no-anthropic", false, "skip counting through the Anthropic API")
+	flag.Float64Var(&c.openaiPrice, "openai-price", 0, "OpenAI input price in USD per 1M tokens, only used by the report to compute the estimate (no charge is made)")
+	flag.StringVar(&c.openaiEncode, "openai-encoding", "o200k_base", "tiktoken encoding (o200k_base = GPT-4o/4.1/5; cl100k_base = GPT-4/3.5)")
 	flag.Parse()
 
-	// Carrega o .env se existir. Variáveis já exportadas no terminal têm prioridade.
+	// Load the .env if it exists. Variables already exported in the terminal take priority.
 	if err := godotenv.Load(c.envFile); err == nil {
-		fmt.Printf("Variáveis carregadas de %s\n", c.envFile)
+		fmt.Printf("Variables loaded from %s\n", c.envFile)
 	} else if !os.IsNotExist(err) {
-		log.Fatalf("erro lendo %s: %v", c.envFile, err)
+		log.Fatalf("error reading %s: %v", c.envFile, err)
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
@@ -62,18 +62,18 @@ func main() {
 
 	if !c.skipFetch {
 		if err := fetchAll(ctx, c); err != nil {
-			log.Fatalf("erro baixando emails: %v", err)
+			log.Fatalf("error downloading emails: %v", err)
 		}
 	}
 
 	emails, err := loadCache(c.cache)
 	if err != nil {
-		log.Fatalf("erro lendo cache: %v", err)
+		log.Fatalf("error reading cache: %v", err)
 	}
 	if len(emails) == 0 {
-		log.Fatal("nenhum email no cache")
+		log.Fatal("no emails in the cache")
 	}
-	fmt.Printf("\n%d emails no cache. Contando tokens...\n", len(emails))
+	fmt.Printf("\n%d emails in the cache. Counting tokens...\n", len(emails))
 
 	report := &report{emails: len(emails)}
 	for _, e := range emails {
@@ -85,7 +85,7 @@ func main() {
 	}
 
 	if !c.noAnthropic && os.Getenv("ANTHROPIC_API_KEY") == "" && os.Getenv("ANTHROPIC_AUTH_TOKEN") == "" {
-		fmt.Println("  (ANTHROPIC_API_KEY não definida; tentando o perfil do `ant auth login`)")
+		fmt.Println("  (ANTHROPIC_API_KEY not set; trying the `ant auth login` profile)")
 	}
 
 	var models []string
@@ -98,19 +98,19 @@ func main() {
 	}
 	batches := makeBatches(emails)
 
-	// A contagem OpenAI (local) e a de cada modelo Claude são independentes:
-	// rodam juntas, com uma única barra de progresso. O client da Anthropic
-	// (e portanto o rate limiter) é compartilhado entre os modelos.
-	prog := newProgress("contando tokens:", "passos", len(emails)+len(models)*len(batches))
+	// The OpenAI count (local) and the count for each Claude model are independent:
+	// they run together, with a single progress bar. The Anthropic client
+	// (and therefore the rate limiter) is shared across models.
+	prog := newProgress("counting tokens:", "steps", len(emails)+len(models)*len(batches))
 	client := newAnthropicClient()
-	claude := make([]modelCount, len(models)) // um slot por goroutine
+	claude := make([]modelCount, len(models)) // one slot per goroutine
 	claudeOK := make([]bool, len(models))
 
 	g, gctx := errgroup.WithContext(ctx)
 	g.SetLimit(maxConcurrentCounts)
 	g.Go(func() error {
 		if err := countOpenAI(emails, c.openaiEncode, report, prog); err != nil {
-			prog.Log(fmt.Sprintf("aviso: contagem OpenAI falhou: %v", err))
+			prog.Log(fmt.Sprintf("warning: OpenAI count failed: %v", err))
 		}
 		return nil
 	})
@@ -118,8 +118,8 @@ func main() {
 		g.Go(func() error {
 			n, err := client.countTokens(gctx, batches, m, prog)
 			if err != nil {
-				prog.Log(fmt.Sprintf("aviso: contagem Anthropic (%s) falhou: %v", m, err))
-				return nil // falha de um modelo não cancela os demais
+				prog.Log(fmt.Sprintf("warning: Anthropic count (%s) failed: %v", m, err))
+				return nil // one model failing does not cancel the others
 			}
 			claude[i], claudeOK[i] = modelCount{model: m, tokens: n}, true
 			return nil

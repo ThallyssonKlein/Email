@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-`email-tokens`: a single-package Go CLI (module `email-tokens`) that downloads all emails from a Gmail account (read-only OAuth) into a local JSONL cache, then estimates how many tokens an AI would use to read them (OpenAI via local `tiktoken`, Claude via the Anthropic `count_tokens` API) plus an input-cost estimate. README.md (in Portuguese) documents setup (Google OAuth `credentials.json`, `.env` with `ANTHROPIC_API_KEY`) and CLI flags. Code comments and user-facing strings are in Portuguese; follow that.
+`email-tokens`: a single-package Go CLI (module `email-tokens`) that downloads all emails from a Gmail account (read-only OAuth) into a local JSONL cache, then estimates how many tokens an AI would use to read them (OpenAI via local `tiktoken`, Claude via the Anthropic `count_tokens` API) plus an input-cost estimate. README.md documents setup (Google OAuth `credentials.json`, `.env` with `ANTHROPIC_API_KEY`) and CLI flags. Everything is in English: docs, code comments, test messages and user-facing strings; follow that.
 
 ## Commands
 

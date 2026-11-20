@@ -36,12 +36,12 @@ func TestAnthropicHonorsRetryAfter(t *testing.T) {
 	defer srv.Close()
 
 	start := time.Now()
-	n, err := testAnthropicClient(srv.URL).count(context.Background(), "m", []string{"oi"})
+	n, err := testAnthropicClient(srv.URL).count(context.Background(), "m", []string{"hi"})
 	if err != nil || n != 42 {
 		t.Fatalf("n=%d err=%v", n, err)
 	}
 	if time.Since(start) < time.Second {
-		t.Fatal("não esperou o Retry-After")
+		t.Fatal("did not wait for Retry-After")
 	}
 }
 
@@ -55,10 +55,10 @@ func TestAnthropicClientErrorDoesNotRetry(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	if _, err := testAnthropicClient(srv.URL).count(context.Background(), "m", []string{"oi"}); err == nil {
-		t.Fatal("esperava erro")
+	if _, err := testAnthropicClient(srv.URL).count(context.Background(), "m", []string{"hi"}); err == nil {
+		t.Fatal("expected an error")
 	}
 	if calls.Load() != 1 {
-		t.Fatalf("401 não deve ter retry, chamadas = %d", calls.Load())
+		t.Fatalf("401 must not be retried, calls = %d", calls.Load())
 	}
 }

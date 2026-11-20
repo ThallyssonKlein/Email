@@ -9,8 +9,8 @@ import (
 	"math/rand/v2"
 )
 
-// retryAfter lê o header Retry-After (segundos ou data HTTP). ok=false se
-// ausente ou inválido.
+// retryAfter reads the Retry-After header (seconds or HTTP date). ok=false if
+// absent or invalid.
 func retryAfter(h http.Header) (d time.Duration, ok bool) {
 	v := strings.TrimSpace(h.Get("Retry-After"))
 	if v == "" {
@@ -25,8 +25,8 @@ func retryAfter(h http.Header) (d time.Duration, ok bool) {
 	return 0, false
 }
 
-// withJitter devolve um valor aleatório em [d/2, d], para que vários
-// workers não tentem de novo todos no mesmo instante.
+// withJitter returns a random value in [d/2, d], so that several
+// workers do not retry all at the same instant.
 func withJitter(d time.Duration) time.Duration {
 	half := d / 2
 	return half + rand.N(half+1)

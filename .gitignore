@@ -1,9 +1,9 @@
-# segredos e dados pessoais — NUNCA commitar
+# secrets and personal data — NEVER commit
 .env
 credentials.json
 token.json
 emails.jsonl
 *.jsonl
 
-# binário
+# binary
 /email-tokens

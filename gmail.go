@@ -28,22 +28,22 @@ import (
 	"google.golang.org/api/option"
 )
 
-// Limites do Gmail API (cota padrão: 6.000 unidades/minuto por usuário; cada
-// messages.get custa 5 → no máximo 20 emails/s). Os padrões ficam abaixo disso.
+// Gmail API limits (default quota: 6,000 units/minute per user; each
+// messages.get costs 5 → at most 20 emails/s). The defaults stay below that.
 const (
-	gmailDefaultRate    = 15 // emails/s (flag -rate)
+	gmailDefaultRate    = 15 // emails/s (-rate flag)
 	gmailBurst          = 1
-	gmailDefaultWorkers = 10               // downloads simultâneos (flag -workers)
-	gmailQuotaPause     = 65 * time.Second // janela de cota é de 1 minuto
+	gmailDefaultWorkers = 10               // simultaneous downloads (-workers flag)
+	gmailQuotaPause     = 65 * time.Second // the quota window is 1 minute
 
-	maxQuotaRetries       = 5                // tentativas após estouro de cota, por email
-	maxServerErrorRetries = 5                // tentativas após 5xx, por email
-	retryBackoffBase      = 2 * time.Second  // backoff inicial para 5xx
-	perMessageTimeout     = 10 * time.Minute // teto de tempo (com retries) por email
+	maxQuotaRetries       = 5                // attempts after quota exhaustion, per email
+	maxServerErrorRetries = 5                // attempts after 5xx, per email
+	retryBackoffBase      = 2 * time.Second  // initial backoff for 5xx
+	perMessageTimeout     = 10 * time.Minute // time cap (with retries) per email
 	oauthShutdownTimeout  = 5 * time.Second
 )
 
-// Email é o que fica salvo no cache (uma linha JSON por email).
+// Email is what gets saved in the cache (one JSON line per email).
 type Email struct {
 	ID          string   `json:"id"`
 	ThreadID    string   `json:"thread_id"`
@@ -53,11 +53,11 @@ type Email struct {
 	Cc          string   `json:"cc,omitempty"`
 	Subject     string   `json:"subject"`
 	Body        string   `json:"body"`
-	HTMLOnly    bool     `json:"html_only,omitempty"` // corpo veio só em HTML e foi convertido p/ texto
+	HTMLOnly    bool     `json:"html_only,omitempty"` // body came only as HTML and was converted to text
 	Attachments []string `json:"attachments,omitempty"`
 }
 
-// Text é exatamente o texto que seria enviado para a IA ler.
+// Text is exactly the text that would be sent to the AI to read.
 func (e Email) Text() string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "From: %s\nTo: %s\n", e.From, e.To)
@@ -78,7 +78,7 @@ func (e Email) Text() string {
 func gmailService(ctx context.Context, c config) (*gmail.Service, error) {
 	raw, err := os.ReadFile(c.credentials)
 	if err != nil {
-		return nil, fmt.Errorf("lendo %s (veja o README para criar): %w", c.credentials, err)
+		return nil, fmt.Errorf("reading %s (see the README to create it): %w", c.credentials, err)
 	}
 	cfg, err := google.ConfigFromJSON(raw, gmail.GmailReadonlyScope)
 	if err != nil {
@@ -92,13 +92,13 @@ func gmailService(ctx context.Context, c config) (*gmail.Service, error) {
 			return nil, err
 		}
 		if err := saveToken(c.tokenFile, tok); err != nil {
-			log.Printf("aviso: não consegui salvar o token: %v", err)
+			log.Printf("warning: could not save the token: %v", err)
 		}
 	}
 	return gmail.NewService(ctx, option.WithHTTPClient(cfg.Client(ctx, tok)))
 }
 
-// loginInBrowser faz o fluxo OAuth de "app desktop" com redirect em loopback.
+// loginInBrowser runs the OAuth "desktop app" flow with a loopback redirect.
 func loginInBrowser(ctx context.Context, cfg *oauth2.Config) (*oauth2.Token, error) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -115,16 +115,16 @@ func loginInBrowser(ctx context.Context, cfg *oauth2.Config) (*oauth2.Token, err
 	errCh := make(chan error, 1)
 	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Query().Get("state") != state {
-			http.Error(w, "state inválido", http.StatusBadRequest)
+			http.Error(w, "invalid state", http.StatusBadRequest)
 			return
 		}
 		if e := r.URL.Query().Get("error"); e != "" {
-			errCh <- fmt.Errorf("autorização negada: %s", e)
-			fmt.Fprintln(w, "Autorização negada. Pode fechar esta aba.")
+			errCh <- fmt.Errorf("authorization denied: %s", e)
+			fmt.Fprintln(w, "Authorization denied. You can close this tab.")
 			return
 		}
 		codeCh <- r.URL.Query().Get("code")
-		fmt.Fprintln(w, "Pronto! Pode fechar esta aba e voltar ao terminal.")
+		fmt.Fprintln(w, "Done! You can close this tab and go back to the terminal.")
 	})}
 	var serveGroup errgroup.Group
 	serveGroup.Go(func() error {
@@ -142,12 +142,12 @@ func loginInBrowser(ctx context.Context, cfg *oauth2.Config) (*oauth2.Token, err
 		defer cancel()
 		_ = srv.Shutdown(sctx)
 		if err := serveGroup.Wait(); err != nil {
-			log.Printf("aviso: servidor de login encerrou com erro: %v", err)
+			log.Printf("warning: login server exited with error: %v", err)
 		}
 	}()
 
 	url := cfg.AuthCodeURL(state, oauth2.AccessTypeOffline)
-	fmt.Printf("Abra este link no navegador para autorizar acesso (somente leitura) ao Gmail:\n\n%s\n\n", url)
+	fmt.Printf("Open this link in your browser to authorize (read-only) access to Gmail:\n\n%s\n\n", url)
 
 	select {
 	case code := <-codeCh:
@@ -193,8 +193,8 @@ func fetchAll(ctx context.Context, c config) error {
 		}
 	}
 
-	// 1) Lista todos os IDs (500 por página).
-	fmt.Println("Listando mensagens...")
+	// 1) List all IDs (500 per page).
+	fmt.Println("Listing messages...")
 	var ids []string
 	call := srv.Users.Messages.List("me").MaxResults(500).IncludeSpamTrash(c.includeSpam)
 	if c.query != "" {
@@ -204,7 +204,7 @@ func fetchAll(ctx context.Context, c config) error {
 		for _, m := range r.Messages {
 			ids = append(ids, m.Id)
 		}
-		fmt.Printf("\r  %d IDs encontrados", len(ids))
+		fmt.Printf("\r  %d IDs found", len(ids))
 		if c.max > 0 && len(ids) >= c.max {
 			return errStop
 		}
@@ -224,7 +224,7 @@ func fetchAll(ctx context.Context, c config) error {
 			todo = append(todo, id)
 		}
 	}
-	fmt.Printf("%d no total, %d já no cache, %d para baixar.\n", len(ids), len(ids)-len(todo), len(todo))
+	fmt.Printf("%d in total, %d already cached, %d to download.\n", len(ids), len(ids)-len(todo), len(todo))
 	if len(todo) == 0 {
 		return nil
 	}
@@ -237,7 +237,7 @@ func fetchAll(ctx context.Context, c config) error {
 	var mu sync.Mutex
 	enc := json.NewEncoder(out)
 
-	prog := newProgress("baixados", "emails", len(todo))
+	prog := newProgress("downloaded", "emails", len(todo))
 	gate := newQuotaGate(c.rate, prog)
 	var ok, failed atomic.Int64
 
@@ -251,18 +251,18 @@ func fetchAll(ctx context.Context, c config) error {
 			msg, err := getWithRetry(gctx, srv, gate, id)
 			if err != nil {
 				if gctx.Err() == nil {
-					prog.Log(fmt.Sprintf("falha em %s: %s (será tentado de novo na próxima execução)", id, shortErr(err)))
+					prog.Log(fmt.Sprintf("failed on %s: %s (will be retried on the next run)", id, shortErr(err)))
 				}
 				failed.Add(1)
 				prog.Add(1, false)
-				return nil // falha de um email não cancela os demais
+				return nil // one email failing does not cancel the others
 			}
 			e := parseMessage(msg)
 			mu.Lock()
 			encErr := enc.Encode(e)
 			mu.Unlock()
 			if encErr != nil {
-				return fmt.Errorf("gravando cache: %w", encErr)
+				return fmt.Errorf("writing cache: %w", encErr)
 			}
 			ok.Add(1)
 			prog.Add(1, true)
@@ -271,23 +271,23 @@ func fetchAll(ctx context.Context, c config) error {
 	}
 	waitErr := g.Wait()
 	prog.Finish()
-	fmt.Printf("Download concluído: %d ok, %d falhas.\n", ok.Load(), failed.Load())
+	fmt.Printf("Download finished: %d ok, %d failed.\n", ok.Load(), failed.Load())
 	if ctx.Err() != nil {
-		fmt.Println("Interrompido — rode de novo para continuar de onde parou.")
+		fmt.Println("Interrupted — run again to continue where it stopped.")
 	}
 	return waitErr
 }
 
 var errStop = errors.New("stop")
 
-// quotaGate controla o ritmo de TODOS os downloads juntos. Quando o Gmail diz
-// que a cota estourou, pausa todo mundo até a janela de 1 minuto renovar, em
-// vez de cada download ficar insistindo (o que mantém a cota estourada).
-// Deve ser criado uma única vez (newQuotaGate) e compartilhado entre workers.
+// quotaGate controls the pace of ALL downloads together. When Gmail says the
+// quota is exhausted, it pauses everyone until the 1-minute window renews,
+// instead of each download insisting (which keeps the quota exhausted).
+// It must be created only once (newQuotaGate) and shared across workers.
 type quotaGate struct {
 	limiter  *rate.Limiter
 	prog     *progress
-	pauseFor time.Duration // quanto esperar quando a cota estoura e não há Retry-After
+	pauseFor time.Duration // how long to wait when the quota is exhausted and there is no Retry-After
 
 	mu    sync.Mutex
 	until time.Time
@@ -326,12 +326,12 @@ func (g *quotaGate) Pause(d time.Duration) {
 	defer g.mu.Unlock()
 	if t := time.Now().Add(d); t.After(g.until) {
 		g.until = t
-		g.prog.SetNote(fmt.Sprintf("cota do Gmail atingida, pausado até %s", t.Format("15:04:05")))
+		g.prog.SetNote(fmt.Sprintf("Gmail quota reached, paused until %s", t.Format("15:04:05")))
 	}
 }
 
-// getWithRetry baixa um email respeitando o gate. Toda tentativa (inclusive
-// retry) passa pelo limiter; o total de tentativas e de tempo é limitado.
+// getWithRetry downloads an email honoring the gate. Every attempt (retries
+// included) goes through the limiter; the total attempts and time are bounded.
 func getWithRetry(ctx context.Context, srv *gmail.Service, gate *quotaGate, id string) (*gmail.Message, error) {
 	ctx, cancel := context.WithTimeout(ctx, perMessageTimeout)
 	defer cancel()
@@ -352,7 +352,7 @@ func getWithRetry(ctx context.Context, srv *gmail.Service, gate *quotaGate, id s
 		}
 		switch {
 		case isRateLimit(gerr) && quotaRetries < maxQuotaRetries:
-			// Limite de cota: esperar Retry-After (ou a janela renovar), todos juntos.
+			// Quota limit: wait for Retry-After (or the window to renew), all together.
 			quotaRetries++
 			wait, ok := retryAfter(gerr.Header)
 			if !ok {
@@ -395,7 +395,7 @@ func isRateLimit(e *googleapi.Error) bool {
 	return false
 }
 
-// shortErr resume o erro em uma linha (sem o JSON de detalhes do Google).
+// shortErr summarizes the error in one line (without Google's JSON details).
 func shortErr(err error) string {
 	var gerr *googleapi.Error
 	if errors.As(err, &gerr) {
@@ -473,8 +473,8 @@ func walkParts(p *gmail.MessagePart, plain, htmls, attachments *[]string) {
 	}
 }
 
-// htmlToText extrai só o texto visível (sem tags, scripts e estilos),
-// que é o que você mandaria para a IA na prática.
+// htmlToText extracts only the visible text (no tags, scripts or styles),
+// which is what you would send to the AI in practice.
 func htmlToText(s string) string {
 	z := html.NewTokenizer(strings.NewReader(s))
 	var b strings.Builder

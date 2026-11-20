@@ -8,9 +8,9 @@ import (
 	"time"
 )
 
-// progress mostra uma linha de progresso que se atualiza no lugar, com
-// porcentagem, velocidade e tempo restante. Pode ser usado por várias
-// goroutines ao mesmo tempo.
+// progress shows a progress line that updates in place, with
+// percentage, speed and remaining time. It can be used by several
+// goroutines at the same time.
 type progress struct {
 	label  string
 	unit   string
@@ -24,7 +24,7 @@ type progress struct {
 	note      string
 }
 
-// SetNote mostra um aviso no fim da linha (ex: pausa por cota). "" remove.
+// SetNote shows a notice at the end of the line (e.g. quota pause). "" removes it.
 func (p *progress) SetNote(s string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -35,7 +35,7 @@ func (p *progress) SetNote(s string) {
 	p.printLocked()
 }
 
-// Log imprime uma mensagem acima da linha de progresso, sem bagunçá-la.
+// Log prints a message above the progress line, without messing it up.
 func (p *progress) Log(msg string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -49,7 +49,7 @@ func newProgress(label, unit string, total int) *progress {
 	return p
 }
 
-// Add registra n itens concluídos (ok=false conta como falha).
+// Add records n completed items (ok=false counts them as failures).
 func (p *progress) Add(n int, ok bool) {
 	d := p.done.Add(int64(n))
 	if !ok {
@@ -57,19 +57,19 @@ func (p *progress) Add(n int, ok bool) {
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	// Redesenha no máximo a cada 500ms (e sempre no último item).
+	// Redraws at most every 500ms (and always on the last item).
 	if d < p.total && time.Since(p.lastPrint) < 500*time.Millisecond {
 		return
 	}
 	p.printLocked()
 }
 
-// Finish desenha o estado final e pula a linha.
+// Finish draws the final state and moves to the next line.
 func (p *progress) Finish() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.printLocked()
-	fmt.Printf(" · levou %s\n", fmtDuration(time.Since(p.start)))
+	fmt.Printf(" · took %s\n", fmtDuration(time.Since(p.start)))
 }
 
 func (p *progress) print() {
@@ -87,17 +87,17 @@ func (p *progress) printLocked() {
 	fmt.Fprintf(&b, "\r\033[K  %s %s/%s", p.label, human(done), human(p.total))
 	if p.total > 0 {
 		pct := float64(done) / float64(p.total) * 100
-		fmt.Fprintf(&b, " (%s%%)", strings.Replace(fmt.Sprintf("%.1f", pct), ".", ",", 1))
+		fmt.Fprintf(&b, " (%.1f%%)", pct)
 	}
 	if done > 0 && elapsed > 0 {
 		rate := float64(done) / elapsed
-		fmt.Fprintf(&b, " · %s %s/s", strings.Replace(fmt.Sprintf("%.1f", rate), ".", ",", 1), p.unit)
+		fmt.Fprintf(&b, " · %.1f %s/s", rate, p.unit)
 		if remaining := p.total - done; remaining > 0 {
-			fmt.Fprintf(&b, " · faltam ~%s", fmtDuration(time.Duration(float64(remaining)/rate*float64(time.Second))))
+			fmt.Fprintf(&b, " · ~%s left", fmtDuration(time.Duration(float64(remaining)/rate*float64(time.Second))))
 		}
 	}
 	if f := p.failed.Load(); f > 0 {
-		fmt.Fprintf(&b, " · %d falhas", f)
+		fmt.Fprintf(&b, " · %d failed", f)
 	}
 	if p.note != "" {
 		fmt.Fprintf(&b, " · %s", p.note)

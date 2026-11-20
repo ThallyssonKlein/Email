@@ -19,7 +19,7 @@ import (
 	"golang.org/x/time/rate"
 )
 
-// ---------- OpenAI (local, grátis, offline) ----------
+// ---------- OpenAI (local, free, offline) ----------
 
 func countOpenAI(emails []Email, encoding string, r *report, prog *progress) error {
 	tiktoken.SetBpeLoader(tiktoken_loader.NewOfflineLoader())
@@ -29,7 +29,7 @@ func countOpenAI(emails []Email, encoding string, r *report, prog *progress) err
 	}
 	var total int64
 	for _, e := range emails {
-		// EncodeOrdinary trata "<|endoftext|>" etc. como texto comum.
+		// EncodeOrdinary treats "<|endoftext|>" etc. as plain text.
 		total += int64(len(enc.EncodeOrdinary(e.Text())))
 		prog.Add(1, true)
 	}
@@ -38,29 +38,29 @@ func countOpenAI(emails []Email, encoding string, r *report, prog *progress) err
 	return nil
 }
 
-// ---------- Anthropic (API count_tokens, grátis, com rate limit) ----------
+// ---------- Anthropic (count_tokens API, free, rate limited) ----------
 
-// Limites da API count_tokens (limite por organização, varia por tier; o
-// menor é 100 requisições/min). Ficamos abaixo disso, e o client é único e
-// compartilhado por todos os modelos.
+// count_tokens API limits (per-organization limit, varies by tier; the
+// lowest is 100 requests/min). We stay below that, and the client is a single
+// one shared by all models.
 const (
 	anthropicRequestsPerSecond = 1.5 // ~90/min
 	anthropicBurst             = 4
-	maxConcurrentCountRequests = 4 // requisições em voo, somando todos os modelos
-	maxConcurrentCounts        = 4 // tarefas de contagem simultâneas (OpenAI + modelos)
+	maxConcurrentCountRequests = 4 // in-flight requests, summed across all models
+	maxConcurrentCounts        = 4 // simultaneous counting tasks (OpenAI + models)
 
-	anthropicMaxRetries     = 5 // após 429/5xx, por requisição
+	anthropicMaxRetries     = 5 // after 429/5xx, per request
 	anthropicBackoffBase    = 2 * time.Second
-	anthropicRequestTimeout = 10 * time.Minute // teto de tempo (com retries) por requisição
+	anthropicRequestTimeout = 10 * time.Minute // time cap (with retries) per request
 )
 
-// Agrupa vários emails por requisição para fazer poucas chamadas.
-// ~300k caracteres fica bem abaixo do contexto de 1M tokens mesmo em textos
-// "caros" (código, CJK etc.).
+// Groups several emails per request to make few calls.
+// ~300k characters stays well below the 1M-token context even for "expensive"
+// text (code, CJK, etc.).
 const maxCharsPerRequest = 300_000
 
-// anthropicClient junta o SDK, o rate limiter e o teto de requisições em voo.
-// Crie um só (newAnthropicClient) e compartilhe entre goroutines.
+// anthropicClient bundles the SDK, the rate limiter and the in-flight request cap.
+// Create a single one (newAnthropicClient) and share it across goroutines.
 type anthropicClient struct {
 	api      anthropic.Client
 	limiter  *rate.Limiter
@@ -69,14 +69,14 @@ type anthropicClient struct {
 
 func newAnthropicClient() *anthropicClient {
 	return &anthropicClient{
-		// Retries ficam por nossa conta: assim cada tentativa passa pelo limiter.
+		// Retries are up to us: that way every attempt goes through the limiter.
 		api:      anthropic.NewClient(option.WithMaxRetries(0)),
 		limiter:  rate.NewLimiter(rate.Limit(anthropicRequestsPerSecond), anthropicBurst),
 		inflight: make(chan struct{}, maxConcurrentCountRequests),
 	}
 }
 
-// count faz uma requisição count_tokens, respeitando limiter, 429/5xx e Retry-After.
+// count makes one count_tokens request, honoring the limiter, 429/5xx and Retry-After.
 func (c *anthropicClient) count(ctx context.Context, model string, blocks []string) (int64, error) {
 	ctx, cancel := context.WithTimeout(ctx, anthropicRequestTimeout)
 	defer cancel()
@@ -133,16 +133,16 @@ func (c *anthropicClient) do(ctx context.Context, params anthropic.MessageCountT
 	return c.api.Messages.CountTokens(ctx, params)
 }
 
-// countTokens soma os tokens de todos os lotes para um modelo.
+// countTokens sums the tokens of all batches for one model.
 func (c *anthropicClient) countTokens(ctx context.Context, batches [][]string, model string, prog *progress) (int64, error) {
-	// Overhead fixo de uma requisição (tokens de formatação da mensagem),
-	// descontado de cada lote para sobrar só o conteúdo dos emails.
-	// Credencial faltando ou modelo inválido (4xx) falham rápido, sem retry.
+	// Fixed overhead of a request (message formatting tokens),
+	// subtracted from each batch so only the emails' content remains.
+	// Missing credentials or an invalid model (4xx) fail fast, without retry.
 	overhead, err := c.count(ctx, model, []string{"."})
 	if err != nil {
 		return 0, err
 	}
-	overhead-- // o "." em si
+	overhead-- // the "." itself
 
 	var total int64
 	var mu sync.Mutex
@@ -179,7 +179,7 @@ func makeBatches(emails []Email) [][]string {
 	}
 	for _, e := range emails {
 		t := e.Text()
-		// Email gigante: divide em pedaços (não trunca, para não subestimar).
+		// Huge email: split into pieces (does not truncate, to avoid underestimating).
 		for len(t) > maxCharsPerRequest {
 			flush()
 			cut := maxCharsPerRequest
@@ -201,7 +201,7 @@ func makeBatches(emails []Email) [][]string {
 
 func utf8Start(b byte) bool { return b&0xC0 != 0x80 }
 
-// ---------- Relatório ----------
+// ---------- Report ----------
 
 type modelCount struct {
 	model  string
@@ -216,28 +216,28 @@ type report struct {
 	claude                        []modelCount
 }
 
-// Preço de input em USD por 1M tokens (API Anthropic, 1ª parte).
+// Input price in USD per 1M tokens (Anthropic API, first-party).
 var claudeInputPrice = map[string]float64{
 	"claude-fable-5-1":  10.00,
 	"claude-opus-5-5":   4.00,
 	"claude-opus-5":     5.00,
 	"claude-sonnet-5-5": 2.00,
 	"claude-sonnet-5":   2.00,
-	"claude-haiku-5-5":  0.10, // prompts até 100K tokens
+	"claude-haiku-5-5":  0.10, // prompts up to 100K tokens
 	"claude-haiku-4-5":  1.00,
 }
 
 func (r *report) print(c config) {
 	fmt.Println()
 	fmt.Println(strings.Repeat("=", 64))
-	fmt.Printf("Emails:              %d\n", r.emails)
-	fmt.Printf("Caracteres:          %s\n", human(r.chars))
-	fmt.Printf("Só HTML (convertido):%d\n", r.htmlOnly)
-	fmt.Printf("Anexos (só o nome):  %d\n", r.attachments)
+	fmt.Printf("Emails:                  %d\n", r.emails)
+	fmt.Printf("Characters:              %s\n", human(r.chars))
+	fmt.Printf("HTML only (converted):   %d\n", r.htmlOnly)
+	fmt.Printf("Attachments (name only): %d\n", r.attachments)
 	fmt.Println(strings.Repeat("=", 64))
 
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', tabwriter.AlignRight)
-	fmt.Fprintln(w, "Modelo\tTokens de input\tMédia/email\tCusto (USD)\tCusto Batch API (USD)\t")
+	fmt.Fprintln(w, "Model\tInput tokens\tAvg/email\tCost (USD)\tBatch API cost (USD)\t")
 	if r.openai > 0 {
 		cost, batch := "-", "-"
 		if c.openaiPrice > 0 {
@@ -256,8 +256,8 @@ func (r *report) print(c config) {
 	}
 	w.Flush()
 	fmt.Println()
-	fmt.Println("Obs: custo considera só a LEITURA (input). Se a IA gerar resposta por email,")
-	fmt.Println("some os tokens de output, e o prompt de instrução multiplicado pelo nº de chamadas.")
+	fmt.Println("Note: cost covers READING only (input). If the AI generates a reply per email,")
+	fmt.Println("add the output tokens, plus the instruction prompt multiplied by the number of calls.")
 }
 
 func human(n int64) string {
@@ -265,7 +265,7 @@ func human(n int64) string {
 	var b strings.Builder
 	for i, ch := range s {
 		if i > 0 && (len(s)-i)%3 == 0 {
-			b.WriteByte('.')
+			b.WriteByte(',')
 		}
 		b.WriteRune(ch)
 	}
